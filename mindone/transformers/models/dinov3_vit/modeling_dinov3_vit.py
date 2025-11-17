@@ -19,13 +19,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import mindspore as ms
+from mindspore import mint, nn
 import math
 from collections.abc import Callable
 from typing import Optional
 
 import numpy as np
-import torch
-from torch import nn
+import mindspore as ms
+from mindspore import nn
 
 from ...activations import ACT2FN
 from ...modeling_layers import GradientCheckpointingLayer
@@ -39,7 +41,7 @@ from ...utils.generic import check_model_inputs
 from .configuration_dinov3_vit import DINOv3ViTConfig
 
 
-class DINOv3ViTEmbeddings(nn.Module):
+class DINOv3ViTEmbeddings(ms.nn.Cell):
     """
     Construct the CLS token, mask token, position and patch embeddings.
     """
@@ -47,14 +49,14 @@ class DINOv3ViTEmbeddings(nn.Module):
     def __init__(self, config: DINOv3ViTConfig):
         super().__init__()
         self.config = config
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
-        self.register_tokens = nn.Parameter(torch.empty(1, config.num_register_tokens, config.hidden_size))
-        self.patch_embeddings = nn.Conv2d(
+        self.cls_token = ms.Parameter(mint.randn(1, 1, config.hidden_size))
+        self.mask_token = ms.Parameter(mint.zeros(1, 1, config.hidden_size))
+        self.register_tokens = ms.Parameter(mint.empty(1, config.num_register_tokens, config.hidden_size))
+        self.patch_embeddings = mint.nn.Conv2d(
             config.num_channels, config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size
         )
 
-    def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def construct(self, pixel_values: ms.Tensor, bool_masked_pos: Optional[ms.Tensor] = None) -> ms.Tensor:
         batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embeddings.weight.dtype
 
@@ -64,20 +66,20 @@ class DINOv3ViTEmbeddings(nn.Module):
 
         if bool_masked_pos is not None:
             mask_token = self.mask_token.to(patch_embeddings.dtype)
-            patch_embeddings = torch.where(bool_masked_pos.unsqueeze(-1), mask_token, patch_embeddings)
+            patch_embeddings = mint.where(bool_masked_pos.unsqueeze(-1), mask_token, patch_embeddings)
 
         # Add CLS and register tokens
         cls_token = self.cls_token.expand(batch_size, -1, -1)
         register_tokens = self.register_tokens.expand(batch_size, -1, -1)
-        embeddings = torch.cat([cls_token, register_tokens, patch_embeddings], dim=1)
+        embeddings = mint.cat([cls_token, register_tokens, patch_embeddings], dim=1)
 
         return embeddings
 
 
 @compile_compatible_method_lru_cache(maxsize=32)
 def get_patches_center_coordinates(
-    num_patches_h: int, num_patches_w: int, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
+    num_patches_h: int, num_patches_w: int, dtype: ms.dtype, device: torch.device
+) -> ms.Tensor:
     """
     Computes the 2D coordinates of the centers of image patches, normalized to the range [-1, +1].
     The center of each patch is exactly halfway between its top-left and bottom-right corners.
@@ -91,12 +93,12 @@ def get_patches_center_coordinates(
         torch.Tensor: A tensor of shape (height * width, 2), where each row contains the (y, x)
             coordinates of a patch center, normalized to [-1, +1].
     """
-    coords_h = torch.arange(0.5, num_patches_h, dtype=dtype, device=device)
-    coords_w = torch.arange(0.5, num_patches_w, dtype=dtype, device=device)
+    coords_h = mint.arange(0.5, num_patches_h, dtype=dtype, )
+    coords_w = mint.arange(0.5, num_patches_w, dtype=dtype, )
     coords_h = coords_h / num_patches_h
     coords_w = coords_w / num_patches_w
     # (height, width, 2) -> (height * width, 2)
-    coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
+    coords = mint.stack(mint.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)
     coords = coords.flatten(0, 1)
     # Shift range [0, 1] to [-1, +1]
     coords = 2.0 * coords - 1.0
@@ -104,36 +106,36 @@ def get_patches_center_coordinates(
 
 
 def augment_patches_center_coordinates(
-    coords: torch.Tensor,
+    coords: ms.Tensor,
     shift: Optional[float] = None,
     jitter: Optional[float] = None,
     rescale: Optional[float] = None,
-) -> torch.Tensor:
+) -> ms.Tensor:
     # Shift coords by adding a uniform value in [-shift, shift]
     if shift is not None:
-        shift_hw = torch.empty((1, 2), device=coords.device, dtype=coords.dtype)
+        shift_hw = mint.empty((1, 2), dtype=coords.dtype)
         shift_hw = shift_hw.uniform_(-shift, shift)
         coords = coords + shift_hw
 
     # Jitter coords by multiplying the range [-1, 1] by a log-uniform value in [1/jitter, jitter]
     if jitter is not None:
         jitter_range = np.log(jitter)
-        jitter_hw = torch.empty((1, 2), device=coords.device, dtype=coords.dtype)
+        jitter_hw = mint.empty((1, 2), dtype=coords.dtype)
         jitter_hw = jitter_hw.uniform_(-jitter_range, jitter_range).exp()
         coords = coords * jitter_hw
 
     # Rescale coords by multiplying the range [-1, 1] by a log-uniform value in [1/rescale, rescale]
     if rescale is not None:
         rescale_range = np.log(rescale)
-        rescale_hw = torch.empty(1, device=coords.device, dtype=coords.dtype)
+        rescale_hw = mint.empty(1, dtype=coords.dtype)
         rescale_hw = rescale_hw.uniform_(-rescale_range, rescale_range).exp()
         coords = coords * rescale_hw
 
     return coords
 
 
-class DINOv3ViTRopePositionEmbedding(nn.Module):
-    inv_freq: torch.Tensor
+class DINOv3ViTRopePositionEmbedding(ms.nn.Cell):
+    inv_freq: ms.Tensor
 
     def __init__(self, config: DINOv3ViTConfig):
         super().__init__()
@@ -144,10 +146,10 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
         self.num_patches_h = config.image_size // config.patch_size
         self.num_patches_w = config.image_size // config.patch_size
 
-        inv_freq = 1 / self.base ** torch.arange(0, 1, 4 / self.head_dim, dtype=torch.float32)  # (head_dim / 4,)
+        inv_freq = 1 / self.base ** mint.arange(0, 1, 4 / self.head_dim, dtype=ms.float32)  # (head_dim / 4,)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def construct(self, pixel_values: ms.Tensor) -> tuple[ms.Tensor, ms.Tensor]:
         _, _, height, width = pixel_values.shape
         num_patches_h = height // self.config.patch_size
         num_patches_w = width // self.config.patch_size
@@ -160,8 +162,7 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
             # the model was trained with random_scale, so it can process images of varying sizes.
             # Therefore, it's better to compute patch_coords dynamically (with lru_cache).
             patch_coords = get_patches_center_coordinates(
-                num_patches_h, num_patches_w, dtype=torch.float32, device=device
-            )
+                num_patches_h, num_patches_w, dtype=ms.float32, )
             if self.training:
                 patch_coords = augment_patches_center_coordinates(
                     patch_coords,
@@ -175,8 +176,8 @@ class DINOv3ViTRopePositionEmbedding(nn.Module):
             angles = angles.flatten(1, 2)
             angles = angles.tile(2)
 
-            cos = torch.cos(angles)
-            sin = torch.sin(angles)
+            cos = mint.cos(angles)
+            sin = mint.sin(angles)
 
         dtype = pixel_values.dtype
         return cos.to(dtype=dtype), sin.to(dtype=dtype)
@@ -186,41 +187,41 @@ def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    return mint.cat((-x2, x1), dim=-1)
 
 
 def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    module: ms.nn.Cell,
+    query: ms.Tensor,
+    key: ms.Tensor,
+    value: ms.Tensor,
+    attention_mask: Optional[ms.Tensor],
     scaling: Optional[float] = None,
     dropout: float = 0.0,
     **kwargs: Unpack[TransformersKwargs],
 ):
     if scaling is None:
-        scaling = query.size(-1) ** -0.5
+        scaling = query.shape[-1] ** -0.5
 
     # Take the dot product between "query" and "key" to get the raw attention scores.
-    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    attn_weights = mint.matmul(query, key.transpose(2, 3)) * scaling
 
     if attention_mask is not None:
         attention_mask = attention_mask[:, :, :, : key.shape[-2]]
         attn_weights = attn_weights + attention_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = mint.nn.functional.softmax(attn_weights, dim=-1)
+    attn_weights = mint.nn.functional.dropout(attn_weights, p=dropout, training=module.training)
 
-    attn_output = torch.matmul(attn_weights, value)
+    attn_output = mint.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **kwargs
-) -> tuple[torch.Tensor, torch.Tensor]:
+    q: ms.Tensor, k: ms.Tensor, cos: ms.Tensor, sin: ms.Tensor, **kwargs
+) -> tuple[ms.Tensor, ms.Tensor]:
     """Applies Rotary Position Embedding to the query and key tensors, but only to the patch tokens,
     ignoring the prefix tokens (cls token and register tokens).
 
@@ -245,13 +246,13 @@ def apply_rotary_pos_emb(
     q_patches = (q_patches * cos) + (rotate_half(q_patches) * sin)
     k_patches = (k_patches * cos) + (rotate_half(k_patches) * sin)
 
-    q = torch.cat((q_prefix_tokens, q_patches), dim=-2)
-    k = torch.cat((k_prefix_tokens, k_patches), dim=-2)
+    q = mint.cat((q_prefix_tokens, q_patches), dim=-2)
+    k = mint.cat((k_prefix_tokens, k_patches), dim=-2)
 
     return q, k
 
 
-class DINOv3ViTAttention(nn.Module):
+class DINOv3ViTAttention(ms.nn.Cell):
     """
     Multi-headed attention compatible with ALL_ATTENTION_FUNCTIONS.
     """
@@ -268,22 +269,22 @@ class DINOv3ViTAttention(nn.Module):
         self.is_causal = False
 
         self.dropout = config.attention_dropout
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.key_bias)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.value_bias)
+        self.k_proj = mint.nn.Linear(self.embed_dim, self.embed_dim, bias=config.key_bias)
+        self.v_proj = mint.nn.Linear(self.embed_dim, self.embed_dim, bias=config.value_bias)
 
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
-        self.o_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
+        self.q_proj = mint.nn.Linear(self.embed_dim, self.embed_dim, bias=config.query_bias)
+        self.o_proj = mint.nn.Linear(self.embed_dim, self.embed_dim, bias=config.proj_bias)
 
-    def forward(
+    def construct(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        hidden_states: ms.Tensor,
+        attention_mask: Optional[ms.Tensor] = None,
+        position_embeddings: Optional[tuple[ms.Tensor, ms.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[ms.Tensor, Optional[ms.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
-        batch_size, patches, _ = hidden_states.size()
+        batch_size, patches, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -317,16 +318,16 @@ class DINOv3ViTAttention(nn.Module):
         return attn_output, attn_weights
 
 
-class DINOv3ViTLayerScale(nn.Module):
+class DINOv3ViTLayerScale(ms.nn.Cell):
     def __init__(self, config) -> None:
         super().__init__()
-        self.lambda1 = nn.Parameter(config.layerscale_value * torch.ones(config.hidden_size))
+        self.lambda1 = ms.Parameter(config.layerscale_value * mint.ones(config.hidden_size))
 
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+    def construct(self, hidden_state: ms.Tensor) -> ms.Tensor:
         return hidden_state * self.lambda1
 
 
-def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+def drop_path(input: ms.Tensor, drop_prob: float = 0.0, training: bool = False) -> ms.Tensor:
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
@@ -335,52 +336,52 @@ def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fals
         return input
     keep_prob = 1 - drop_prob
     shape = (input.shape[0],) + (1,) * (input.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=input.dtype, device=input.device)
+    random_tensor = keep_prob + mint.rand(shape, dtype=input.dtype, )
     random_tensor.floor_()  # binarize
     output = input.div(keep_prob) * random_tensor
     return output
 
 
-class DINOv3ViTDropPath(nn.Module):
+class DINOv3ViTDropPath(ms.nn.Cell):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
 
     def __init__(self, drop_prob: Optional[float] = None) -> None:
         super().__init__()
         self.drop_prob = drop_prob
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def construct(self, hidden_states: ms.Tensor) -> ms.Tensor:
         return drop_path(hidden_states, self.drop_prob, self.training)
 
     def extra_repr(self) -> str:
         return f"p={self.drop_prob}"
 
 
-class DINOv3ViTMLP(nn.Module):
+class DINOv3ViTMLP(ms.nn.Cell):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.up_proj = mint.nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = mint.nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def construct(self, x):
         return self.down_proj(self.act_fn(self.up_proj(x)))
 
 
-class DINOv3ViTGatedMLP(nn.Module):
+class DINOv3ViTGatedMLP(ms.nn.Cell):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = mint.nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = mint.nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = mint.nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def construct(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -391,12 +392,12 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
     def __init__(self, config: DINOv3ViTConfig):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = mint.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = DINOv3ViTAttention(config)
         self.layer_scale1 = DINOv3ViTLayerScale(config)
-        self.drop_path = DINOv3ViTDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
+        self.drop_path = DINOv3ViTDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else mint.nn.Identity()
 
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = mint.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         if config.use_gated_mlp:
             self.mlp = DINOv3ViTGatedMLP(config)
@@ -404,12 +405,12 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
             self.mlp = DINOv3ViTMLP(config)
         self.layer_scale2 = DINOv3ViTLayerScale(config)
 
-    def forward(
+    def construct(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        hidden_states: ms.Tensor,
+        attention_mask: Optional[ms.Tensor] = None,
+        position_embeddings: Optional[tuple[ms.Tensor, ms.Tensor]] = None,
+    ) -> ms.Tensor:
         # Attention with residual connection
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
@@ -450,28 +451,28 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module) -> None:
         """Initialize the weights"""
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        if isinstance(module, (mint.nn.Linear, mint.nn.Conv2d)):
             # Upcast the input in `fp32` and cast it back to desired `dtype` to avoid
             # `trunc_normal_cpu` not implemented in `half` issues
             module.weight.data = nn.init.trunc_normal_(
-                module.weight.data.to(torch.float32),
+                module.weight.data.to(ms.float32),
                 mean=0.0,
                 std=self.config.initializer_range,
             ).to(module.weight.dtype)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, mint.nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         elif isinstance(module, DINOv3ViTEmbeddings):
             module.cls_token.data = nn.init.trunc_normal_(
-                module.cls_token.data.to(torch.float32),
+                module.cls_token.data.to(ms.float32),
                 mean=0.0,
                 std=self.config.initializer_range,
             ).to(module.cls_token.dtype)
             if module.config.num_register_tokens > 0:
                 module.register_tokens.data = nn.init.trunc_normal_(
-                    module.register_tokens.data.to(torch.float32),
+                    module.register_tokens.data.to(ms.float32),
                     mean=0.0,
                     std=self.config.initializer_range,
                 ).to(module.register_tokens.dtype)
@@ -487,8 +488,8 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         self.config = config
         self.embeddings = DINOv3ViTEmbeddings(config)
         self.rope_embeddings = DINOv3ViTRopePositionEmbedding(config)
-        self.layer = nn.ModuleList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer = ms.nn.CellList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = mint.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -498,10 +499,10 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
 
     @check_model_inputs(tie_last_hidden_states=False)
     @auto_docstring
-    def forward(
+    def construct(
         self,
-        pixel_values: torch.Tensor,
-        bool_masked_pos: Optional[torch.Tensor] = None,
+        pixel_values: ms.Tensor,
+        bool_masked_pos: Optional[ms.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPooling:
         r"""
@@ -534,8 +535,8 @@ class DINOv3ViTBackbone(DINOv3ViTPreTrainedModel, BackboneMixin):
 
         self.embeddings = DINOv3ViTEmbeddings(config)
         self.rope_embeddings = DINOv3ViTRopePositionEmbedding(config)
-        self.layer = nn.ModuleList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer = ms.nn.CellList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = mint.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.gradient_checkpointing = False
 
         self.num_features = [config.hidden_size for _ in range(config.num_hidden_layers + 1)]
@@ -546,9 +547,9 @@ class DINOv3ViTBackbone(DINOv3ViTPreTrainedModel, BackboneMixin):
 
     @check_model_inputs()
     @can_return_tuple
-    def forward(
+    def construct(
         self,
-        pixel_values: torch.Tensor,
+        pixel_values: ms.Tensor,
         output_hidden_states: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BackboneOutput:
@@ -556,7 +557,7 @@ class DINOv3ViTBackbone(DINOv3ViTPreTrainedModel, BackboneMixin):
         hidden_states = self.embeddings(pixel_values)
         position_embeddings = self.rope_embeddings(pixel_values)
 
-        stage_hidden_states: list[torch.Tensor] = [hidden_states]
+        stage_hidden_states: list[ms.Tensor] = [hidden_states]
 
         for layer_module in self.layer:
             hidden_states = layer_module(hidden_states, position_embeddings=position_embeddings)
