@@ -19,29 +19,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mindspore as ms
-from mindspore import mint, nn
 import math
-from collections.abc import Callable
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import mindspore as ms
-from mindspore import nn
+from mindspore import mint
+from mindspore.mint import nn
 
 from ...activations import ACT2FN
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import BackboneOutput, BaseModelOutputWithPooling
+from ...modeling_outputs import BaseModelOutputWithPooling
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...pytorch_utils import compile_compatible_method_lru_cache
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
-from ...utils.backbone_utils import BackboneMixin
+from ...utils import TransformersKwargs, auto_docstring
 from ...utils.generic import check_model_inputs
 from .configuration_dinov3_vit import DINOv3ViTConfig
 
 
-class DINOv3ViTEmbeddings(ms.nn.Cell):
+class DINOv3ViTEmbeddings(nn.Cell):
     """
     Construct the CLS token, mask token, position and patch embeddings.
     """
@@ -134,7 +131,7 @@ def augment_patches_center_coordinates(
     return coords
 
 
-class DINOv3ViTRopePositionEmbedding(ms.nn.Cell):
+class DINOv3ViTRopePositionEmbedding(nn.Cell):
     inv_freq: ms.Tensor
 
     def __init__(self, config: DINOv3ViTConfig):
@@ -191,27 +188,28 @@ def rotate_half(x):
 
 
 def eager_attention_forward(
-    module: ms.nn.Cell,
+    module: nn.Cell,
     query: ms.Tensor,
     key: ms.Tensor,
     value: ms.Tensor,
     attention_mask: Optional[ms.Tensor],
-    scaling: Optional[float] = None,
+    scaling: float,
     dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
+    **kwargs,
 ):
-    if scaling is None:
-        scaling = query.shape[-1] ** -0.5
-
     # Take the dot product between "query" and "key" to get the raw attention scores.
-    attn_weights = mint.matmul(query, key.transpose(2, 3)) * scaling
+    attn_weights = mint.matmul(query, key.transpose(-1, -2)) * scaling
 
-    if attention_mask is not None:
-        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-        attn_weights = attn_weights + attention_mask
+    # Normalize the attention scores to probabilities.
+    attn_weights = mint.nn.functional.softmax(attn_weights, dim=-1, dtype=ms.float32).to(query.dtype)
 
-    attn_weights = mint.nn.functional.softmax(attn_weights, dim=-1)
+    # This is actually dropping out entire tokens to attend to, which might
+    # seem a bit unusual, but is taken from the original Transformer paper.
     attn_weights = mint.nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    # Mask heads if we want to
+    if attention_mask is not None:
+        attn_weights = attn_weights * attention_mask
 
     attn_output = mint.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2).contiguous()
@@ -252,7 +250,7 @@ def apply_rotary_pos_emb(
     return q, k
 
 
-class DINOv3ViTAttention(ms.nn.Cell):
+class DINOv3ViTAttention(nn.Cell):
     """
     Multi-headed attention compatible with ALL_ATTENTION_FUNCTIONS.
     """
@@ -318,7 +316,7 @@ class DINOv3ViTAttention(ms.nn.Cell):
         return attn_output, attn_weights
 
 
-class DINOv3ViTLayerScale(ms.nn.Cell):
+class DINOv3ViTLayerScale(nn.Cell):
     def __init__(self, config) -> None:
         super().__init__()
         self.lambda1 = ms.Parameter(config.layerscale_value * mint.ones(config.hidden_size))
@@ -331,6 +329,11 @@ def drop_path(input: ms.Tensor, drop_prob: float = 0.0, training: bool = False) 
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
+    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
+    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
+    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
+    argument.
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -342,7 +345,7 @@ def drop_path(input: ms.Tensor, drop_prob: float = 0.0, training: bool = False) 
     return output
 
 
-class DINOv3ViTDropPath(ms.nn.Cell):
+class DINOv3ViTDropPath(nn.Cell):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
 
     def __init__(self, drop_prob: Optional[float] = None) -> None:
@@ -356,7 +359,7 @@ class DINOv3ViTDropPath(ms.nn.Cell):
         return f"p={self.drop_prob}"
 
 
-class DINOv3ViTMLP(ms.nn.Cell):
+class DINOv3ViTMLP(nn.Cell):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -370,7 +373,7 @@ class DINOv3ViTMLP(ms.nn.Cell):
         return self.down_proj(self.act_fn(self.up_proj(x)))
 
 
-class DINOv3ViTGatedMLP(ms.nn.Cell):
+class DINOv3ViTGatedMLP(nn.Cell):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -437,7 +440,6 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
     config: DINOv3ViTConfig
     base_model_prefix = "dinov3_vit"
     main_input_name = "pixel_values"
-    input_modalities = "image"
     supports_gradient_checkpointing = True
     _no_split_modules = ["DINOv3ViTLayer"]
     _supports_sdpa = True
@@ -488,7 +490,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         self.config = config
         self.embeddings = DINOv3ViTEmbeddings(config)
         self.rope_embeddings = DINOv3ViTRopePositionEmbedding(config)
-        self.layer = ms.nn.CellList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.CellList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = mint.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -497,12 +499,13 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
     def get_input_embeddings(self):
         return self.embeddings.patch_embeddings
 
-    @check_model_inputs(tie_last_hidden_states=False)
+    @check_model_inputs
     @auto_docstring
     def construct(
         self,
         pixel_values: ms.Tensor,
         bool_masked_pos: Optional[ms.Tensor] = None,
+        head_mask: Optional[ms.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPooling:
         r"""
@@ -516,87 +519,20 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         position_embeddings = self.rope_embeddings(pixel_values)
 
         for i, layer_module in enumerate(self.layer):
+            layer_head_mask = head_mask[i] if head_mask is not None else None
             hidden_states = layer_module(
                 hidden_states,
+                attention_mask=layer_head_mask,
                 position_embeddings=position_embeddings,
             )
 
         sequence_output = self.norm(hidden_states)
         pooled_output = sequence_output[:, 0, :]
 
-        return BaseModelOutputWithPooling(last_hidden_state=sequence_output, pooler_output=pooled_output)
+        return BaseModelOutputWithPooling(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+        )
 
 
-@auto_docstring
-class DINOv3ViTBackbone(DINOv3ViTPreTrainedModel, BackboneMixin):
-    def __init__(self, config):
-        super().__init__(config)
-        super()._init_backbone(config)
-
-        self.embeddings = DINOv3ViTEmbeddings(config)
-        self.rope_embeddings = DINOv3ViTRopePositionEmbedding(config)
-        self.layer = ms.nn.CellList([DINOv3ViTLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = mint.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.gradient_checkpointing = False
-
-        self.num_features = [config.hidden_size for _ in range(config.num_hidden_layers + 1)]
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embeddings.patch_embeddings
-
-    @check_model_inputs()
-    @can_return_tuple
-    def construct(
-        self,
-        pixel_values: ms.Tensor,
-        output_hidden_states: Optional[bool] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BackboneOutput:
-        pixel_values = pixel_values.to(self.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.embeddings(pixel_values)
-        position_embeddings = self.rope_embeddings(pixel_values)
-
-        stage_hidden_states: list[ms.Tensor] = [hidden_states]
-
-        for layer_module in self.layer:
-            hidden_states = layer_module(hidden_states, position_embeddings=position_embeddings)
-            stage_hidden_states.append(hidden_states)
-
-        batch_size, _, image_height, image_width = pixel_values.shape
-        patch_size = self.config.patch_size
-        num_patches_height = image_height // patch_size
-        num_patches_width = image_width // patch_size
-
-        num_prefix = 1 + getattr(self.config, "num_register_tokens", 0)
-
-        feature_maps = []
-        sequence_output = None
-        last_stage_idx = len(self.stage_names) - 1
-        for idx, (stage_name, hidden_state) in enumerate(zip(self.stage_names, stage_hidden_states)):
-            if idx == last_stage_idx:
-                hidden_state = self.norm(hidden_state)
-                sequence_output = hidden_state
-            elif self.config.apply_layernorm:
-                hidden_state = self.norm(hidden_state)
-
-            if stage_name in self.out_features:
-                patch_tokens = hidden_state[:, num_prefix:, :]
-                if self.config.reshape_hidden_states:
-                    fmap = (
-                        patch_tokens.reshape(batch_size, num_patches_height, num_patches_width, patch_tokens.shape[-1])
-                        .permute(0, 3, 1, 2)
-                        .contiguous()
-                    )
-                else:
-                    fmap = patch_tokens
-
-                feature_maps.append(fmap)
-
-        output = BackboneOutput(feature_maps=tuple(feature_maps))
-        output.last_hidden_state = sequence_output
-
-        return output
-
-
-__all__ = ["DINOv3ViTModel", "DINOv3ViTPreTrainedModel", "DINOv3ViTBackbone"]
+__all__ = ["DINOv3ViTModel", "DINOv3ViTPreTrainedModel"]
