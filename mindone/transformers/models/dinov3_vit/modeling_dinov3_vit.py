@@ -7,6 +7,9 @@
 # coding=utf-8
 # Copyright 2025 Meta AI and The HuggingFace Inc. team. All rights reserved.
 #
+# This code is adapted from https://github.com/huggingface/transformers
+# with modifications to run transformers on mindspore.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -32,10 +35,10 @@ from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPooling
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...pytorch_utils import compile_compatible_method_lru_cache
-from ...utils import TransformersKwargs, auto_docstring
+from ...utils import TransformersKwargs
 from ...utils.generic import check_model_inputs
-from .configuration_dinov3_vit import DINOv3ViTConfig
+from transformers.models.dinov3_vit.configuration_dinov3_vit import DINOv3ViTConfig
+from transformers.utils import auto_docstring
 
 
 class DINOv3ViTEmbeddings(nn.Cell):
@@ -47,7 +50,7 @@ class DINOv3ViTEmbeddings(nn.Cell):
         super().__init__()
         self.config = config
         self.cls_token = ms.Parameter(mint.randn(1, 1, config.hidden_size))
-        self.mask_token = ms.Parameter(mint.zeros(1, 1, config.hidden_size))
+        self.mask_token = ms.Parameter(mint.zeros((1, 1, config.hidden_size)))
         self.register_tokens = ms.Parameter(mint.empty(1, config.num_register_tokens, config.hidden_size))
         self.patch_embeddings = mint.nn.Conv2d(
             config.num_channels, config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size
@@ -73,9 +76,8 @@ class DINOv3ViTEmbeddings(nn.Cell):
         return embeddings
 
 
-@compile_compatible_method_lru_cache(maxsize=32)
 def get_patches_center_coordinates(
-    num_patches_h: int, num_patches_w: int, dtype: ms.dtype, device: torch.device
+    num_patches_h: int, num_patches_w: int, dtype: ms.dtype
 ) -> ms.Tensor:
     """
     Computes the 2D coordinates of the centers of image patches, normalized to the range [-1, +1].
@@ -84,14 +86,14 @@ def get_patches_center_coordinates(
     Args:
         num_patches_h (int): Number of patches along the vertical (height) axis.
         num_patches_w (int): Number of patches along the horizontal (width) axis.
-        dtype (torch.dtype): The desired data type of the returned tensor.
+        dtype (ms.dtype): The desired data type of the returned tensor.
 
     Returns:
-        torch.Tensor: A tensor of shape (height * width, 2), where each row contains the (y, x)
+        ms.Tensor: A tensor of shape (height * width, 2), where each row contains the (y, x)
             coordinates of a patch center, normalized to [-1, +1].
     """
-    coords_h = mint.arange(0.5, num_patches_h, dtype=dtype, )
-    coords_w = mint.arange(0.5, num_patches_w, dtype=dtype, )
+    coords_h = mint.arange(0.5, num_patches_h, dtype=dtype)
+    coords_w = mint.arange(0.5, num_patches_w, dtype=dtype)
     coords_h = coords_h / num_patches_h
     coords_w = coords_w / num_patches_w
     # (height, width, 2) -> (height * width, 2)
@@ -151,30 +153,26 @@ class DINOv3ViTRopePositionEmbedding(nn.Cell):
         num_patches_h = height // self.config.patch_size
         num_patches_w = width // self.config.patch_size
 
-        device = pixel_values.device
-        device_type = device.type if isinstance(device.type, str) and device.type != "mps" else "cpu"
+        # Although we could precompute static patch_coords from image_size and patch_size in the config,
+        # the model was trained with random_scale, so it can process images of varying sizes.
+        # Therefore, it's better to compute patch_coords dynamically (with lru_cache).
+        patch_coords = get_patches_center_coordinates(
+            num_patches_h, num_patches_w, dtype=ms.float32)
+        if self.training:
+            patch_coords = augment_patches_center_coordinates(
+                patch_coords,
+                shift=self.config.pos_embed_shift,
+                jitter=self.config.pos_embed_jitter,
+                rescale=self.config.pos_embed_rescale,
+            )
 
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            # Although we could precompute static patch_coords from image_size and patch_size in the config,
-            # the model was trained with random_scale, so it can process images of varying sizes.
-            # Therefore, it's better to compute patch_coords dynamically (with lru_cache).
-            patch_coords = get_patches_center_coordinates(
-                num_patches_h, num_patches_w, dtype=ms.float32, )
-            if self.training:
-                patch_coords = augment_patches_center_coordinates(
-                    patch_coords,
-                    shift=self.config.pos_embed_shift,
-                    jitter=self.config.pos_embed_jitter,
-                    rescale=self.config.pos_embed_rescale,
-                )
+        # (height * width, 2, head_dim / 4) -> (height * width, head_dim / 2) -> (height * width, head_dim)
+        angles = 2 * math.pi * patch_coords[:, :, None] * self.inv_freq[None, None, :]
+        angles = angles.flatten(1, 2)
+        angles = angles.tile(2)
 
-            # (height * width, 2, head_dim / 4) -> (height * width, head_dim / 2) -> (height * width, head_dim)
-            angles = 2 * math.pi * patch_coords[:, :, None] * self.inv_freq[None, None, :]
-            angles = angles.flatten(1, 2)
-            angles = angles.tile(2)
-
-            cos = mint.cos(angles)
-            sin = mint.sin(angles)
+        cos = mint.cos(angles)
+        sin = mint.sin(angles)
 
         dtype = pixel_values.dtype
         return cos.to(dtype=dtype), sin.to(dtype=dtype)
@@ -187,7 +185,7 @@ def rotate_half(x):
     return mint.cat((-x2, x1), dim=-1)
 
 
-def eager_attention_forward(
+def eager_attention_construct(
     module: nn.Cell,
     query: ms.Tensor,
     key: ms.Tensor,
@@ -224,13 +222,13 @@ def apply_rotary_pos_emb(
     ignoring the prefix tokens (cls token and register tokens).
 
     Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        q (`ms.Tensor`): The query tensor.
+        k (`ms.Tensor`): The key tensor.
+        cos (`ms.Tensor`): The cosine part of the rotary embedding.
+        sin (`ms.Tensor`): The sine part of the rotary embedding.
 
     Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+        `tuple(ms.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
 
     num_tokens = q.shape[-2]
@@ -295,7 +293,7 @@ class DINOv3ViTAttention(nn.Cell):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attention_interface: Callable = eager_attention_forward
+        attention_interface: Callable = eager_attention_construct
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
@@ -339,7 +337,7 @@ def drop_path(input: ms.Tensor, drop_prob: float = 0.0, training: bool = False) 
         return input
     keep_prob = 1 - drop_prob
     shape = (input.shape[0],) + (1,) * (input.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + mint.rand(shape, dtype=input.dtype, )
+    random_tensor = keep_prob + mint.rand(shape, dtype=input.dtype)
     random_tensor.floor_()  # binarize
     output = input.div(keep_prob) * random_tensor
     return output
@@ -454,30 +452,16 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module) -> None:
         """Initialize the weights"""
         if isinstance(module, (mint.nn.Linear, mint.nn.Conv2d)):
-            # Upcast the input in `fp32` and cast it back to desired `dtype` to avoid
-            # `trunc_normal_cpu` not implemented in `half` issues
-            module.weight.data = nn.init.trunc_normal_(
-                module.weight.data.to(ms.float32),
-                mean=0.0,
-                std=self.config.initializer_range,
-            ).to(module.weight.dtype)
+            module.weight.data.trunc_normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, mint.nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         elif isinstance(module, DINOv3ViTEmbeddings):
-            module.cls_token.data = nn.init.trunc_normal_(
-                module.cls_token.data.to(ms.float32),
-                mean=0.0,
-                std=self.config.initializer_range,
-            ).to(module.cls_token.dtype)
+            module.cls_token.data.trunc_normal_(mean=0.0, std=self.config.initializer_range)
             if module.config.num_register_tokens > 0:
-                module.register_tokens.data = nn.init.trunc_normal_(
-                    module.register_tokens.data.to(ms.float32),
-                    mean=0.0,
-                    std=self.config.initializer_range,
-                ).to(module.register_tokens.dtype)
+                module.register_tokens.data.trunc_normal_(mean=0.0, std=self.config.initializer_range)
             module.mask_token.data.zero_()
         elif isinstance(module, DINOv3ViTLayerScale):
             module.lambda1.data.fill_(self.config.layerscale_value)
@@ -509,7 +493,7 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPooling:
         r"""
-        bool_masked_pos (`torch.BoolTensor` of shape `(batch_size, sequence_length)`):
+        bool_masked_pos (`ms.BoolTensor` of shape `(batch_size, sequence_length)`):
             Boolean masked positions. Indicates which patches are masked (1) and which aren't (0). Only relevant for
             pre-training.
         """
