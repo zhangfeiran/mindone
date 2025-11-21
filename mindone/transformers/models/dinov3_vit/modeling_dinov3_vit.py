@@ -27,8 +27,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import mindspore as ms
-from mindspore import mint
-from mindspore.mint import nn
+from mindspore import mint, nn
 
 from ...activations import ACT2FN
 from ...modeling_layers import GradientCheckpointingLayer
@@ -37,8 +36,8 @@ from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs
 from ...utils.generic import check_model_inputs
+from mindone.models.utils import trunc_normal_
 from transformers.models.dinov3_vit.configuration_dinov3_vit import DINOv3ViTConfig
-from transformers.utils import auto_docstring
 
 
 class DINOv3ViTEmbeddings(nn.Cell):
@@ -433,7 +432,6 @@ class DINOv3ViTLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-@auto_docstring
 class DINOv3ViTPreTrainedModel(PreTrainedModel):
     config: DINOv3ViTConfig
     base_model_prefix = "dinov3_vit"
@@ -452,22 +450,21 @@ class DINOv3ViTPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module) -> None:
         """Initialize the weights"""
         if isinstance(module, (mint.nn.Linear, mint.nn.Conv2d)):
-            module.weight.data.trunc_normal_(mean=0.0, std=self.config.initializer_range)
+            trunc_normal_(module.weight,mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, mint.nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         elif isinstance(module, DINOv3ViTEmbeddings):
-            module.cls_token.data.trunc_normal_(mean=0.0, std=self.config.initializer_range)
+            trunc_normal_(module.cls_token.data,mean=0.0, std=self.config.initializer_range)
             if module.config.num_register_tokens > 0:
-                module.register_tokens.data.trunc_normal_(mean=0.0, std=self.config.initializer_range)
+                trunc_normal_(module.register_tokens,mean=0.0, std=self.config.initializer_range)
             module.mask_token.data.zero_()
         elif isinstance(module, DINOv3ViTLayerScale):
             module.lambda1.data.fill_(self.config.layerscale_value)
 
 
-@auto_docstring
 class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
     def __init__(self, config: DINOv3ViTConfig):
         super().__init__(config)
@@ -484,7 +481,6 @@ class DINOv3ViTModel(DINOv3ViTPreTrainedModel):
         return self.embeddings.patch_embeddings
 
     @check_model_inputs
-    @auto_docstring
     def construct(
         self,
         pixel_values: ms.Tensor,
